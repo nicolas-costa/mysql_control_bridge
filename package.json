@@ -2,6 +2,7 @@
   "name": "mysql_control_bridge",
   "version": "1.1.0",
   "description": "Servidor MCP para MySQL com suporte completo para desenvolvimento",
+  "repository": "https://github.com/nicolas-costa/mysql-control-bridge.git",
   "main": "server.js",
   "bin": {
     "mysql-control-bridge": "./server.js"
