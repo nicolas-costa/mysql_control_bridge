@@ -1,6 +1,6 @@
 # MySQL Control Bridge
 
-Servidor MCP (Model Context Protocol) para integração com MySQL, permitindo que IAs executem consultas seguras e obtenham informações detalhadas sobre bancos de dados MySQL através de ferramentas estruturadas.
+Servidor MCP (Model Context Protocol) para integração com MySQL, permitindo que IAs executem consultas seguras e obtenham informações detalhadas sobre bancos de dados MySQL através de ferramentas estruturadas. Suporta conexão direta ou através de túnel SSH com autenticação por chave privada (.pem/.cer).
 
 ## Funcionalidades
 
@@ -17,11 +17,17 @@ Servidor MCP (Model Context Protocol) para integração com MySQL, permitindo qu
 - **Descrever triggers** - Liste todos os triggers de uma tabela ou banco
 - **Descrever procedures** - Liste todas as stored procedures e funções
 
+### Conexão
+- **Conexão direta** - Conecte-se diretamente ao MySQL
+- **Túnel SSH** - Conecte-se através de túnel SSH usando arquivo de chave (.pem/.cer)
+- **Configuração flexível** - Suporte a múltiplos ambientes e interpolação de variáveis
+
 ### Segurança
 - **Somente SELECTs** - Apenas consultas de leitura são permitidas
 - **Limite de resultados** - Máximo de 1000 registros por consulta
 - **Validação de queries** - Verificação automática de comandos perigosos
 - **Conexão segura** - Sem multiple statements habilitados
+- **Autenticação SSH** - Suporte a chaves privadas para túneis SSH seguros
 
 ## Instalação
 
