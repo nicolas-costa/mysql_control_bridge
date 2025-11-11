@@ -166,7 +166,7 @@ class MySQLControlBridge {
     this.server = new Server(
       {
         name: 'mysql-control-bridge',
-        version: '1.1.0',
+        version: '1.2.0',
       },
       {
         capabilities: {
@@ -842,7 +842,7 @@ class MySQLControlBridge {
   async run() {
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
-    console.error('🚀 MySQL Control Bridge iniciado (v1.1.0)');
+    console.error('🚀 MySQL Control Bridge iniciado (v1.2.0)');
   }
 }
 

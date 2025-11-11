@@ -543,7 +543,7 @@ Após configurar o servidor, você pode usar comandos como:
 
 ## Versão
 
-1.1.0
+1.2.0
 
 ## Licença
 
