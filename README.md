@@ -1,6 +1,6 @@
 # MySQL Control Bridge
 
-Servidor MCP (Model Context Protocol) para integração com MySQL, permitindo que IAs executem consultas seguras e obtenham informações detalhadas sobre bancos de dados MySQL através de ferramentas estruturadas.
+Servidor MCP (Model Context Protocol) para integração com MySQL, permitindo que IAs executem consultas seguras e obtenham informações detalhadas sobre bancos de dados MySQL através de ferramentas estruturadas. Suporta conexão direta ou através de túnel SSH com autenticação por chave privada (.pem/.cer).
 
 ## Funcionalidades
 
@@ -17,11 +17,17 @@ Servidor MCP (Model Context Protocol) para integração com MySQL, permitindo qu
 - **Descrever triggers** - Liste todos os triggers de uma tabela ou banco
 - **Descrever procedures** - Liste todas as stored procedures e funções
 
+### Conexão
+- **Conexão direta** - Conecte-se diretamente ao MySQL
+- **Túnel SSH** - Conecte-se através de túnel SSH usando arquivo de chave (.pem/.cer)
+- **Configuração flexível** - Suporte a múltiplos ambientes e interpolação de variáveis
+
 ### Segurança
 - **Somente SELECTs** - Apenas consultas de leitura são permitidas
 - **Limite de resultados** - Máximo de 1000 registros por consulta
 - **Validação de queries** - Verificação automática de comandos perigosos
 - **Conexão segura** - Sem multiple statements habilitados
+- **Autenticação SSH** - Suporte a chaves privadas para túneis SSH seguros
 
 ## Instalação
 
@@ -53,6 +59,26 @@ MYSQL_DATABASE=sua_base_dados
 MYSQL_PORT=3306              # Padrão: 3306
 MYSQL_PASSWORD=sua_senha     # Padrão: string vazia
 ```
+
+### Conexão via Túnel SSH
+
+Para conectar ao MySQL através de um túnel SSH usando arquivo de chave (.pem/.cer), configure as seguintes variáveis:
+
+```bash
+SSH_HOST=servidor-ssh.example.com    # Host do servidor SSH (obrigatório para SSH)
+SSH_USER=usuario_ssh                 # Usuário SSH (obrigatório para SSH)
+SSH_KEY_FILE=/caminho/para/chave.pem # Caminho para arquivo de chave .pem/.cer (obrigatório para SSH)
+SSH_PORT=22                          # Porta SSH (opcional, padrão: 22)
+SSH_PASSPHRASE=senha_chave           # Senha da chave privada (opcional, apenas se a chave estiver protegida)
+```
+
+**Notas importantes:**
+- Quando usando túnel SSH, `MYSQL_HOST` deve apontar para o host do MySQL **no servidor remoto** (geralmente `localhost` ou `127.0.0.1`)
+- `MYSQL_PORT` deve ser a porta do MySQL **no servidor remoto** (geralmente `3306`)
+- O arquivo de chave pode ser `.pem`, `.cer`, ou qualquer formato de chave privada SSH suportado
+- O caminho do arquivo pode ser absoluto ou relativo ao diretório de trabalho
+- Se todas as variáveis SSH (`SSH_HOST`, `SSH_USER`, `SSH_KEY_FILE`) estiverem configuradas, o túnel SSH será criado automaticamente
+- Se nenhuma variável SSH estiver configurada, a conexão será direta ao MySQL (comportamento padrão)
 
 ## Configuração das Variáveis de Ambiente
 
@@ -289,6 +315,50 @@ DB_PASSWORD_PROD=prod_pass
 DB_NAME_PROD=production_db
 ```
 
+### Exemplo com Túnel SSH
+
+Para conectar através de túnel SSH usando arquivo de chave:
+
+**`.cursor/mcp.json`:**
+```json
+{
+  "mcpServers": {
+    "mysql-ssh": {
+      "command": "npx",
+      "args": ["-y", "mysql_control_bridge"],
+      "env": {
+        "SSH_HOST": "${SSH_HOST}",
+        "SSH_USER": "${SSH_USER}",
+        "SSH_KEY_FILE": "${SSH_KEY_FILE}",
+        "SSH_PORT": "${SSH_PORT:-22}",
+        "MYSQL_HOST": "localhost",
+        "MYSQL_PORT": "3306",
+        "MYSQL_USER": "${MYSQL_USER}",
+        "MYSQL_PASSWORD": "${MYSQL_PASSWORD}",
+        "MYSQL_DATABASE": "${MYSQL_DATABASE}"
+      }
+    }
+  }
+}
+```
+
+**`.cursor/.env`:**
+```env
+SSH_HOST=servidor-remoto.example.com
+SSH_USER=usuario_ssh
+SSH_KEY_FILE=/caminho/para/minha-chave.pem
+SSH_PORT=22
+MYSQL_USER=mysql_user
+MYSQL_PASSWORD=mysql_password
+MYSQL_DATABASE=meu_banco
+```
+
+**Notas:**
+- `MYSQL_HOST` deve ser `localhost` ou `127.0.0.1` quando usando túnel SSH (pois o MySQL está no servidor remoto)
+- `MYSQL_PORT` deve ser a porta do MySQL no servidor remoto (geralmente `3306`)
+- `SSH_KEY_FILE` pode ser um caminho absoluto ou relativo ao diretório de trabalho
+- Se a chave privada estiver protegida por senha, adicione `SSH_PASSPHRASE` no `.env`
+
 ### Exemplos de Interpolação
 
 **Valor padrão:**
@@ -446,6 +516,25 @@ Após configurar o servidor, você pode usar comandos como:
 ```
 **Solução:** Verifique se o nome da view está correto e se ela existe no banco de dados atual.
 
+### Erro ao criar túnel SSH
+```
+❌ Erro ao criar túnel SSH: connect ECONNREFUSED
+```
+**Solução:** 
+- Verifique se o servidor SSH está acessível e a porta está correta
+- Confirme que o arquivo de chave existe e tem permissões corretas (chmod 600 recomendado)
+- Verifique se o usuário SSH tem acesso ao servidor
+- Se a chave estiver protegida por senha, configure `SSH_PASSPHRASE`
+
+### Arquivo de chave SSH não encontrado
+```
+❌ Arquivo de chave SSH não encontrado: /caminho/para/chave.pem
+```
+**Solução:** 
+- Verifique se o caminho em `SSH_KEY_FILE` está correto
+- Use caminho absoluto ou relativo ao diretório de trabalho
+- Confirme que o arquivo existe e tem permissões de leitura
+
 ## Requisitos
 
 - Node.js >= 14
@@ -454,7 +543,7 @@ Após configurar o servidor, você pode usar comandos como:
 
 ## Versão
 
-1.1.0
+1.2.0
 
 ## Licença
 

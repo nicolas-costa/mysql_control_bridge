@@ -10,6 +10,7 @@ const mysql = require('mysql2/promise');
 const path = require('path');
 const fs = require('fs');
 const dotenv = require('dotenv');
+const { createTunnel } = require('tunnel-ssh');
 
 // Carregar arquivos .env na ordem de prioridade (da mais baixa para mais alta):
 // 1. .env na raiz do projeto (fallback mais baixo)
@@ -165,7 +166,7 @@ class MySQLControlBridge {
     this.server = new Server(
       {
         name: 'mysql-control-bridge',
-        version: '1.1.0',
+        version: '1.2.0',
       },
       {
         capabilities: {
@@ -175,22 +176,104 @@ class MySQLControlBridge {
     );
 
     this.connection = null;
+    this.sshTunnel = null;
     this.setupHandlers();
+  }
+
+  async createSshTunnel() {
+    // Verificar se SSH está configurado
+    const sshHost = process.env.SSH_HOST;
+    const sshUser = process.env.SSH_USER;
+    const sshKeyFile = process.env.SSH_KEY_FILE;
+
+    if (!sshHost || !sshUser || !sshKeyFile) {
+      return null; // SSH não configurado, conexão direta
+    }
+
+    // Validar se o arquivo de chave existe
+    const keyPath = path.resolve(sshKeyFile);
+    if (!fs.existsSync(keyPath)) {
+      throw new Error(`Arquivo de chave SSH não encontrado: ${keyPath}`);
+    }
+
+    // Ler a chave privada
+    const privateKey = fs.readFileSync(keyPath, 'utf8');
+
+    // Configurações SSH (sshOptions)
+    const sshOptions = {
+      host: sshHost,
+      port: parseInt(process.env.SSH_PORT || '22'),
+      username: sshUser,
+      privateKey: privateKey,
+      passphrase: process.env.SSH_PASSPHRASE || undefined,
+      readyTimeout: 20000,
+    };
+
+    // Configurações do destino (MySQL no servidor remoto)
+    const mysqlRemoteHost = process.env.MYSQL_HOST || 'localhost';
+    const mysqlRemotePort = parseInt(process.env.MYSQL_PORT || '3306');
+
+    console.error(`🔐 Criando túnel SSH: ${sshUser}@${sshHost}:${sshOptions.port} -> ${mysqlRemoteHost}:${mysqlRemotePort}`);
+
+    try {
+      // Opções do túnel (autoClose: false para manter o túnel aberto)
+      const tunnelOptions = { autoClose: false };
+      
+      // Opções do servidor local (porta 0 = porta aleatória disponível)
+      const serverOptions = { host: '127.0.0.1', port: 0 };
+      
+      // Opções de forwarding (destino no servidor remoto)
+      const forwardOptions = {
+        srcAddr: '127.0.0.1',
+        dstAddr: mysqlRemoteHost,
+        dstPort: mysqlRemotePort,
+      };
+
+      // Criar túnel usando a API v5 (async/await)
+      const [server] = await createTunnel(tunnelOptions, serverOptions, sshOptions, forwardOptions);
+      
+      const actualPort = server.address().port;
+      console.error(`✅ Túnel SSH criado: localhost:${actualPort} -> ${mysqlRemoteHost}:${mysqlRemotePort} via ${sshHost}`);
+      
+      return { server, localPort: actualPort };
+    } catch (error) {
+      throw new Error(`Erro ao criar túnel SSH: ${error.message}`);
+    }
   }
 
   async connect() {
     try {
       // Validar ENVs obrigatórias
-      const requiredEnvs = ['MYSQL_HOST', 'MYSQL_USER', 'MYSQL_DATABASE'];
+      const requiredEnvs = ['MYSQL_USER', 'MYSQL_DATABASE'];
       const missing = requiredEnvs.filter(env => !process.env[env]);
 
       if (missing.length > 0) {
         throw new Error(`Variáveis de ambiente faltando: ${missing.join(', ')}`);
       }
 
+      // Criar túnel SSH se configurado
+      let mysqlHost = process.env.MYSQL_HOST || 'localhost';
+      let mysqlPort = parseInt(process.env.MYSQL_PORT || '3306');
+
+      const sshConfig = process.env.SSH_HOST && process.env.SSH_USER && process.env.SSH_KEY_FILE;
+      if (sshConfig) {
+        const tunnelResult = await this.createSshTunnel();
+        if (tunnelResult) {
+          this.sshTunnel = tunnelResult.server;
+          mysqlHost = 'localhost';
+          mysqlPort = tunnelResult.localPort;
+          console.error(`🔗 Conectando ao MySQL através do túnel SSH (localhost:${mysqlPort})`);
+        }
+      } else {
+        // Validar MYSQL_HOST quando não usando SSH
+        if (!process.env.MYSQL_HOST) {
+          throw new Error('Variável de ambiente faltando: MYSQL_HOST (ou configure SSH_HOST, SSH_USER e SSH_KEY_FILE para túnel SSH)');
+        }
+      }
+
       this.connection = await mysql.createConnection({
-        host: process.env.MYSQL_HOST,
-        port: parseInt(process.env.MYSQL_PORT || '3306'),
+        host: mysqlHost,
+        port: mysqlPort,
         user: process.env.MYSQL_USER,
         password: process.env.MYSQL_PASSWORD || '',
         database: process.env.MYSQL_DATABASE,
@@ -199,7 +282,10 @@ class MySQLControlBridge {
 
       // Testar conexão
       await this.connection.ping();
-      console.error(`✅ Conectado ao MySQL: ${process.env.MYSQL_DATABASE}@${process.env.MYSQL_HOST}`);
+      const connectionInfo = sshConfig 
+        ? `${process.env.MYSQL_DATABASE}@${process.env.MYSQL_HOST}:${process.env.MYSQL_PORT} (via SSH ${process.env.SSH_HOST})`
+        : `${process.env.MYSQL_DATABASE}@${mysqlHost}:${mysqlPort}`;
+      console.error(`✅ Conectado ao MySQL: ${connectionInfo}`);
     } catch (error) {
       console.error('❌ Erro ao conectar ao MySQL:', error.message);
       console.error('📋 ENVs disponíveis:', {
@@ -207,9 +293,18 @@ class MySQLControlBridge {
         MYSQL_PORT: process.env.MYSQL_PORT,
         MYSQL_USER: process.env.MYSQL_USER,
         MYSQL_DATABASE: process.env.MYSQL_DATABASE,
+        SSH_HOST: process.env.SSH_HOST,
+        SSH_USER: process.env.SSH_USER,
+        SSH_KEY_FILE: process.env.SSH_KEY_FILE,
         // Não logar a senha por segurança
-        MYSQL_PASSWORD: process.env.MYSQL_PASSWORD ? '***' : 'não definida'
+        MYSQL_PASSWORD: process.env.MYSQL_PASSWORD ? '***' : 'não definida',
+        SSH_PASSPHRASE: process.env.SSH_PASSPHRASE ? '***' : 'não definida'
       });
+      // Fechar túnel SSH em caso de erro
+      if (this.sshTunnel) {
+        this.sshTunnel.close();
+        this.sshTunnel = null;
+      }
       throw error;
     }
   }
@@ -754,7 +849,7 @@ class MySQLControlBridge {
   async run() {
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
-    console.error('🚀 MySQL Control Bridge iniciado (v1.1.0)');
+    console.error('🚀 MySQL Control Bridge iniciado (v1.2.0)');
   }
 }
 
@@ -766,18 +861,23 @@ server.run().catch((error) => {
 });
 
 // Cleanup
-process.on('SIGINT', async () => {
+async function cleanup() {
   console.error('🔌 Desconectando...');
   if (server.connection) {
     await server.connection.end();
   }
+  if (server.sshTunnel) {
+    server.sshTunnel.close();
+    console.error('🔐 Túnel SSH fechado');
+  }
+}
+
+process.on('SIGINT', async () => {
+  await cleanup();
   process.exit(0);
 });
 
 process.on('SIGTERM', async () => {
-  console.error('🔌 Desconectando...');
-  if (server.connection) {
-    await server.connection.end();
-  }
+  await cleanup();
   process.exit(0);
 });

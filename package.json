@@ -1,6 +1,6 @@
 {
   "name": "mysql_control_bridge",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Servidor MCP para MySQL com suporte completo para desenvolvimento",
   "repository": "https://github.com/nicolas-costa/mysql-control-bridge.git",
   "main": "server.js",
@@ -17,6 +17,7 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.18.0",
     "dotenv": "^16.4.5",
-    "mysql2": "^3.14.5"
+    "mysql2": "^3.14.5",
+    "tunnel-ssh": "^5.1.0"
   }
 }
