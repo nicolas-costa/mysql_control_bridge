@@ -10,7 +10,7 @@ const mysql = require('mysql2/promise');
 const path = require('path');
 const fs = require('fs');
 const dotenv = require('dotenv');
-const tunnel = require('tunnel-ssh');
+const { createTunnel } = require('tunnel-ssh');
 
 // Carregar arquivos .env na ordem de prioridade (da mais baixa para mais alta):
 // 1. .env na raiz do projeto (fallback mais baixo)
@@ -199,8 +199,8 @@ class MySQLControlBridge {
     // Ler a chave privada
     const privateKey = fs.readFileSync(keyPath, 'utf8');
 
-    // Configurações do túnel SSH
-    const sshConfig = {
+    // Configurações SSH (sshOptions)
+    const sshOptions = {
       host: sshHost,
       port: parseInt(process.env.SSH_PORT || '22'),
       username: sshUser,
@@ -213,25 +213,32 @@ class MySQLControlBridge {
     const mysqlRemoteHost = process.env.MYSQL_HOST || 'localhost';
     const mysqlRemotePort = parseInt(process.env.MYSQL_PORT || '3306');
 
-    // Porta local para o túnel (0 = porta aleatória disponível)
-    const localPort = 0;
+    console.error(`🔐 Criando túnel SSH: ${sshUser}@${sshHost}:${sshOptions.port} -> ${mysqlRemoteHost}:${mysqlRemotePort}`);
 
-    console.error(`🔐 Criando túnel SSH: ${sshUser}@${sshHost}:${sshConfig.port} -> ${mysqlRemoteHost}:${mysqlRemotePort}`);
+    try {
+      // Opções do túnel (autoClose: false para manter o túnel aberto)
+      const tunnelOptions = { autoClose: false };
+      
+      // Opções do servidor local (porta 0 = porta aleatória disponível)
+      const serverOptions = { host: '127.0.0.1', port: 0 };
+      
+      // Opções de forwarding (destino no servidor remoto)
+      const forwardOptions = {
+        srcAddr: '127.0.0.1',
+        dstAddr: mysqlRemoteHost,
+        dstPort: mysqlRemotePort,
+      };
 
-    return new Promise((resolve, reject) => {
-      tunnel(sshConfig, {
-        host: mysqlRemoteHost,
-        port: mysqlRemotePort,
-      }, (error, server) => {
-        if (error) {
-          reject(new Error(`Erro ao criar túnel SSH: ${error.message}`));
-          return;
-        }
-        const actualPort = server.address().port;
-        console.error(`✅ Túnel SSH criado: localhost:${actualPort} -> ${mysqlRemoteHost}:${mysqlRemotePort} via ${sshHost}`);
-        resolve({ server, localPort: actualPort });
-      });
-    });
+      // Criar túnel usando a API v5 (async/await)
+      const [server] = await createTunnel(tunnelOptions, serverOptions, sshOptions, forwardOptions);
+      
+      const actualPort = server.address().port;
+      console.error(`✅ Túnel SSH criado: localhost:${actualPort} -> ${mysqlRemoteHost}:${mysqlRemotePort} via ${sshHost}`);
+      
+      return { server, localPort: actualPort };
+    } catch (error) {
+      throw new Error(`Erro ao criar túnel SSH: ${error.message}`);
+    }
   }
 
   async connect() {
