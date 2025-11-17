@@ -109,7 +109,7 @@ Configure múltiplos hosts usando uma variável JSON:
 
 #### Opção 2: Padrão de prefixo (HOSTNAME_*)
 
-Configure hosts usando variáveis com prefixo:
+Configure hosts usando variáveis com prefixo. O nome do host (em qualquer case) é usado como prefixo:
 
 ```json
 {
@@ -131,6 +131,33 @@ Configure hosts usando variáveis com prefixo:
   }
 }
 ```
+
+**Exemplo com nomes em lowercase (como `weclever`, `cleversale`):**
+
+```json
+{
+  "mcpServers": {
+    "mysql": {
+      "command": "npx",
+      "args": ["-y", "mysql_control_bridge"],
+      "env": {
+        "weclever_MYSQL_HOST": "${DB_HOST}",
+        "weclever_MYSQL_PORT": "${DB_PORT:-3306}",
+        "weclever_MYSQL_USER": "${DB_USER}",
+        "weclever_MYSQL_PASSWORD": "${DB_PASSWORD}",
+        "weclever_MYSQL_DATABASE": "${DB_NAME}",
+        "cleversale_MYSQL_HOST": "cleversale-instance.ckmvlkitdfxh.us-east-1.rds.amazonaws.com",
+        "cleversale_MYSQL_PORT": "3306",
+        "cleversale_MYSQL_USER": "daniel.venancio",
+        "cleversale_MYSQL_PASSWORD": "Y5@24CBe15GZ20$",
+        "cleversale_MYSQL_DATABASE": "prod_cleversale"
+      }
+    }
+  }
+}
+```
+
+**Nota importante:** O formato com objetos aninhados diretamente no `env` não é suportado pelo Cursor, pois variáveis de ambiente são sempre strings planas. Use o formato de prefixo mostrado acima, onde cada variável segue o padrão `HOSTNAME_MYSQL_*` ou `HOSTNAME_SSH_*`.
 
 #### Opção 3: Modo compatibilidade (host único)
 

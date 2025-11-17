@@ -199,25 +199,75 @@ class MySQLControlBridge {
       }
     }
 
-    // Fallback: verificar se há variáveis com padrão HOSTNAME_*
-    // Exemplo: HOST1_MYSQL_HOST, HOST1_MYSQL_USER, etc.
-    const hostPatterns = {};
+    // Verificar se o Cursor serializou objetos aninhados do env como variáveis especiais
+    // Formato: quando há objetos aninhados no mcp.json env, o Cursor pode criar variáveis
+    // como HOSTNAME_MYSQL_HOST, HOSTNAME_MYSQL_USER, etc.
+    // Também pode serializar como JSON em uma variável especial
     for (const key in process.env) {
-      const match = key.match(/^([A-Z0-9_]+)_(MYSQL_|SSH_)/);
-      if (match) {
-        const hostPrefix = match[1];
-        const configKey = key.replace(`${hostPrefix}_`, '');
-        if (!hostPatterns[hostPrefix]) {
-          hostPatterns[hostPrefix] = {};
+      // Tentar detectar se alguma variável contém um objeto JSON com hosts
+      if (key.includes('HOST') && process.env[key] && process.env[key].startsWith('{')) {
+        try {
+          const parsed = JSON.parse(process.env[key]);
+          // Verificar se parece com configuração de hosts (objeto de objetos)
+          if (typeof parsed === 'object' && !Array.isArray(parsed)) {
+            const firstKey = Object.keys(parsed)[0];
+            if (firstKey && parsed[firstKey] && typeof parsed[firstKey] === 'object' && parsed[firstKey].MYSQL_HOST) {
+              this.hostsConfig = parsed;
+              console.error(`✅ Configuração de múltiplos hosts detectada em variável ${key}: ${Object.keys(this.hostsConfig).length} host(s)`);
+              return;
+            }
+          }
+        } catch (e) {
+          // Não é JSON válido, continuar
         }
-        hostPatterns[hostPrefix][configKey] = process.env[key];
+      }
+    }
+
+    // Fallback: verificar se há variáveis com padrão HOSTNAME_*
+    // Exemplo: weclever_MYSQL_HOST, cleversale_MYSQL_USER, etc.
+    // Também suporta formato do Cursor onde objetos são serializados
+    const hostPatterns = {};
+    const hostNames = new Set();
+    
+    // Primeiro, coletar todos os nomes de hosts possíveis
+    for (const key in process.env) {
+      // Padrão: HOSTNAME_MYSQL_* ou HOSTNAME_SSH_* (case-insensitive)
+      // Exemplos: weclever_MYSQL_HOST, CLEVERSALE_MYSQL_USER, etc.
+      const match = key.match(/^([A-Za-z0-9_]+)_(MYSQL_|SSH_)/i);
+      if (match) {
+        const hostPrefix = match[1].toLowerCase(); // Normalizar para lowercase
+        hostNames.add(hostPrefix);
+      }
+    }
+    
+    // Agora, agrupar variáveis por host
+    for (const hostName of hostNames) {
+      const hostUpper = hostName.toUpperCase();
+      const hostConfig = {};
+      let hasConfig = false;
+      
+      // Procurar todas as variáveis que começam com HOSTNAME_
+      for (const key in process.env) {
+        const upperKey = key.toUpperCase();
+        if (upperKey.startsWith(`${hostUpper}_`)) {
+          const configKey = key.substring(hostName.length + 1); // Remove "hostname_"
+          hostConfig[configKey] = process.env[key];
+          hasConfig = true;
+        }
+      }
+      
+      if (hasConfig) {
+        // Verificar se tem pelo menos MYSQL_USER e MYSQL_DATABASE (mínimo necessário)
+        if (hostConfig.MYSQL_USER && hostConfig.MYSQL_DATABASE) {
+          hostPatterns[hostName] = hostConfig;
+        }
       }
     }
 
     // Se encontrou padrões de host, usar eles
     if (Object.keys(hostPatterns).length > 0) {
       this.hostsConfig = hostPatterns;
-      console.error(`✅ Configuração de múltiplos hosts detectada via padrão: ${Object.keys(this.hostsConfig).length} host(s)`);
+      console.error(`✅ Configuração de múltiplos hosts detectada via padrão: ${Object.keys(this.hostsConfig).join(', ')}`);
       return;
     }
 
