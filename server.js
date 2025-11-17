@@ -166,7 +166,7 @@ class MySQLControlBridge {
     this.server = new Server(
       {
         name: 'mysql-control-bridge',
-        version: '1.2.0',
+        version: '1.3.0',
       },
       {
         capabilities: {
@@ -175,16 +175,104 @@ class MySQLControlBridge {
       }
     );
 
-    this.connection = null;
-    this.sshTunnel = null;
+    // Pool de conexões por host: { hostName: { connection, sshTunnel, config } }
+    this.connections = {};
+    this.hostsConfig = {};
     this.setupHandlers();
+    this.loadHostsConfig();
   }
 
-  async createSshTunnel() {
+  // Carregar configuração de múltiplos hosts das variáveis de ambiente
+  loadHostsConfig() {
+    // Verificar se há configuração de múltiplos hosts
+    // Formato esperado: MYSQL_HOSTS como JSON string ou variáveis individuais por host
+    // Exemplo: MYSQL_HOSTS='{"host1":{"MYSQL_HOST":"...","MYSQL_USER":"..."},"host2":{...}}'
+    
+    const hostsJson = process.env.MYSQL_HOSTS;
+    if (hostsJson) {
+      try {
+        this.hostsConfig = JSON.parse(hostsJson);
+        console.error(`✅ Configuração de múltiplos hosts carregada: ${Object.keys(this.hostsConfig).length} host(s)`);
+        return;
+      } catch (error) {
+        console.error(`⚠️ Erro ao parsear MYSQL_HOSTS: ${error.message}`);
+      }
+    }
+
+    // Fallback: verificar se há variáveis com padrão HOSTNAME_*
+    // Exemplo: HOST1_MYSQL_HOST, HOST1_MYSQL_USER, etc.
+    const hostPatterns = {};
+    for (const key in process.env) {
+      const match = key.match(/^([A-Z0-9_]+)_(MYSQL_|SSH_)/);
+      if (match) {
+        const hostPrefix = match[1];
+        const configKey = key.replace(`${hostPrefix}_`, '');
+        if (!hostPatterns[hostPrefix]) {
+          hostPatterns[hostPrefix] = {};
+        }
+        hostPatterns[hostPrefix][configKey] = process.env[key];
+      }
+    }
+
+    // Se encontrou padrões de host, usar eles
+    if (Object.keys(hostPatterns).length > 0) {
+      this.hostsConfig = hostPatterns;
+      console.error(`✅ Configuração de múltiplos hosts detectada via padrão: ${Object.keys(this.hostsConfig).length} host(s)`);
+      return;
+    }
+
+    // Fallback: modo compatibilidade - usar variáveis diretas como "default"
+    const hasDirectConfig = process.env.MYSQL_USER && process.env.MYSQL_DATABASE;
+    if (hasDirectConfig) {
+      this.hostsConfig = {
+        default: {
+          MYSQL_HOST: process.env.MYSQL_HOST,
+          MYSQL_PORT: process.env.MYSQL_PORT,
+          MYSQL_USER: process.env.MYSQL_USER,
+          MYSQL_PASSWORD: process.env.MYSQL_PASSWORD,
+          MYSQL_DATABASE: process.env.MYSQL_DATABASE,
+          SSH_HOST: process.env.SSH_HOST,
+          SSH_USER: process.env.SSH_USER,
+          SSH_KEY_FILE: process.env.SSH_KEY_FILE,
+          SSH_PORT: process.env.SSH_PORT,
+          SSH_PASSPHRASE: process.env.SSH_PASSPHRASE,
+        }
+      };
+      console.error(`✅ Modo compatibilidade: usando configuração direta como host "default"`);
+    } else {
+      console.error(`⚠️ Nenhuma configuração de host encontrada`);
+    }
+  }
+
+  // Obter lista de hosts disponíveis
+  getAvailableHosts() {
+    return Object.keys(this.hostsConfig);
+  }
+
+  // Validar se um host existe
+  validateHost(hostName) {
+    if (!hostName) {
+      // Se não especificado e há apenas um host, usar ele
+      const hosts = this.getAvailableHosts();
+      if (hosts.length === 1) {
+        return hosts[0];
+      }
+      throw new Error(`Parâmetro 'host' é obrigatório. Hosts disponíveis: ${hosts.join(', ')}`);
+    }
+
+    if (!this.hostsConfig[hostName]) {
+      const available = this.getAvailableHosts().join(', ');
+      throw new Error(`Host '${hostName}' não encontrado. Hosts disponíveis: ${available}`);
+    }
+
+    return hostName;
+  }
+
+  async createSshTunnel(config) {
     // Verificar se SSH está configurado
-    const sshHost = process.env.SSH_HOST;
-    const sshUser = process.env.SSH_USER;
-    const sshKeyFile = process.env.SSH_KEY_FILE;
+    const sshHost = config.SSH_HOST;
+    const sshUser = config.SSH_USER;
+    const sshKeyFile = config.SSH_KEY_FILE;
 
     if (!sshHost || !sshUser || !sshKeyFile) {
       return null; // SSH não configurado, conexão direta
@@ -202,16 +290,16 @@ class MySQLControlBridge {
     // Configurações SSH (sshOptions)
     const sshOptions = {
       host: sshHost,
-      port: parseInt(process.env.SSH_PORT || '22'),
+      port: parseInt(config.SSH_PORT || '22'),
       username: sshUser,
       privateKey: privateKey,
-      passphrase: process.env.SSH_PASSPHRASE || undefined,
+      passphrase: config.SSH_PASSPHRASE || undefined,
       readyTimeout: 20000,
     };
 
     // Configurações do destino (MySQL no servidor remoto)
-    const mysqlRemoteHost = process.env.MYSQL_HOST || 'localhost';
-    const mysqlRemotePort = parseInt(process.env.MYSQL_PORT || '3306');
+    const mysqlRemoteHost = config.MYSQL_HOST || 'localhost';
+    const mysqlRemotePort = parseInt(config.MYSQL_PORT || '3306');
 
     console.error(`🔐 Criando túnel SSH: ${sshUser}@${sshHost}:${sshOptions.port} -> ${mysqlRemoteHost}:${mysqlRemotePort}`);
 
@@ -241,77 +329,150 @@ class MySQLControlBridge {
     }
   }
 
-  async connect() {
+  async connect(hostName) {
+    // Validar e obter nome do host
+    hostName = this.validateHost(hostName);
+    
+    // Se já existe conexão ativa para este host, reutilizar
+    if (this.connections[hostName] && this.connections[hostName].connection) {
+      try {
+        await this.connections[hostName].connection.ping();
+        return this.connections[hostName].connection;
+      } catch (error) {
+        // Conexão morreu, limpar e reconectar
+        console.error(`⚠️ Conexão com host '${hostName}' expirou, reconectando...`);
+        await this.disconnect(hostName);
+      }
+    }
+
+    const config = this.hostsConfig[hostName];
+    if (!config) {
+      throw new Error(`Configuração não encontrada para host '${hostName}'`);
+    }
+
     try {
       // Validar ENVs obrigatórias
       const requiredEnvs = ['MYSQL_USER', 'MYSQL_DATABASE'];
-      const missing = requiredEnvs.filter(env => !process.env[env]);
+      const missing = requiredEnvs.filter(env => !config[env]);
 
       if (missing.length > 0) {
-        throw new Error(`Variáveis de ambiente faltando: ${missing.join(', ')}`);
+        throw new Error(`Variáveis de ambiente faltando para host '${hostName}': ${missing.join(', ')}`);
       }
 
       // Criar túnel SSH se configurado
-      let mysqlHost = process.env.MYSQL_HOST || 'localhost';
-      let mysqlPort = parseInt(process.env.MYSQL_PORT || '3306');
+      let mysqlHost = config.MYSQL_HOST || 'localhost';
+      let mysqlPort = parseInt(config.MYSQL_PORT || '3306');
+      let sshTunnel = null;
 
-      const sshConfig = process.env.SSH_HOST && process.env.SSH_USER && process.env.SSH_KEY_FILE;
+      const sshConfig = config.SSH_HOST && config.SSH_USER && config.SSH_KEY_FILE;
       if (sshConfig) {
-        const tunnelResult = await this.createSshTunnel();
+        const tunnelResult = await this.createSshTunnel(config);
         if (tunnelResult) {
-          this.sshTunnel = tunnelResult.server;
+          sshTunnel = tunnelResult.server;
           mysqlHost = 'localhost';
           mysqlPort = tunnelResult.localPort;
-          console.error(`🔗 Conectando ao MySQL através do túnel SSH (localhost:${mysqlPort})`);
+          console.error(`🔗 Conectando ao MySQL (host: ${hostName}) através do túnel SSH (localhost:${mysqlPort})`);
         }
       } else {
         // Validar MYSQL_HOST quando não usando SSH
-        if (!process.env.MYSQL_HOST) {
-          throw new Error('Variável de ambiente faltando: MYSQL_HOST (ou configure SSH_HOST, SSH_USER e SSH_KEY_FILE para túnel SSH)');
+        if (!config.MYSQL_HOST) {
+          throw new Error(`Variável de ambiente faltando para host '${hostName}': MYSQL_HOST (ou configure SSH_HOST, SSH_USER e SSH_KEY_FILE para túnel SSH)`);
         }
       }
 
-      this.connection = await mysql.createConnection({
+      const connection = await mysql.createConnection({
         host: mysqlHost,
         port: mysqlPort,
-        user: process.env.MYSQL_USER,
-        password: process.env.MYSQL_PASSWORD || '',
-        database: process.env.MYSQL_DATABASE,
+        user: config.MYSQL_USER,
+        password: config.MYSQL_PASSWORD || '',
+        database: config.MYSQL_DATABASE,
         multipleStatements: false // Segurança - prevenir SQL injection
       });
 
       // Testar conexão
-      await this.connection.ping();
+      await connection.ping();
       const connectionInfo = sshConfig 
-        ? `${process.env.MYSQL_DATABASE}@${process.env.MYSQL_HOST}:${process.env.MYSQL_PORT} (via SSH ${process.env.SSH_HOST})`
-        : `${process.env.MYSQL_DATABASE}@${mysqlHost}:${mysqlPort}`;
+        ? `${config.MYSQL_DATABASE}@${config.MYSQL_HOST}:${config.MYSQL_PORT} (via SSH ${config.SSH_HOST}) [host: ${hostName}]`
+        : `${config.MYSQL_DATABASE}@${mysqlHost}:${mysqlPort} [host: ${hostName}]`;
       console.error(`✅ Conectado ao MySQL: ${connectionInfo}`);
+
+      // Armazenar conexão no pool
+      this.connections[hostName] = {
+        connection,
+        sshTunnel,
+        config
+      };
+
+      return connection;
     } catch (error) {
-      console.error('❌ Erro ao conectar ao MySQL:', error.message);
-      console.error('📋 ENVs disponíveis:', {
-        MYSQL_HOST: process.env.MYSQL_HOST,
-        MYSQL_PORT: process.env.MYSQL_PORT,
-        MYSQL_USER: process.env.MYSQL_USER,
-        MYSQL_DATABASE: process.env.MYSQL_DATABASE,
-        SSH_HOST: process.env.SSH_HOST,
-        SSH_USER: process.env.SSH_USER,
-        SSH_KEY_FILE: process.env.SSH_KEY_FILE,
+      console.error(`❌ Erro ao conectar ao MySQL (host: ${hostName}):`, error.message);
+      console.error(`📋 Config disponível para host '${hostName}':`, {
+        MYSQL_HOST: config.MYSQL_HOST,
+        MYSQL_PORT: config.MYSQL_PORT,
+        MYSQL_USER: config.MYSQL_USER,
+        MYSQL_DATABASE: config.MYSQL_DATABASE,
+        SSH_HOST: config.SSH_HOST,
+        SSH_USER: config.SSH_USER,
+        SSH_KEY_FILE: config.SSH_KEY_FILE,
         // Não logar a senha por segurança
-        MYSQL_PASSWORD: process.env.MYSQL_PASSWORD ? '***' : 'não definida',
-        SSH_PASSPHRASE: process.env.SSH_PASSPHRASE ? '***' : 'não definida'
+        MYSQL_PASSWORD: config.MYSQL_PASSWORD ? '***' : 'não definida',
+        SSH_PASSPHRASE: config.SSH_PASSPHRASE ? '***' : 'não definida'
       });
       // Fechar túnel SSH em caso de erro
-      if (this.sshTunnel) {
-        this.sshTunnel.close();
-        this.sshTunnel = null;
+      if (this.connections[hostName] && this.connections[hostName].sshTunnel) {
+        this.connections[hostName].sshTunnel.close();
+        delete this.connections[hostName];
       }
       throw error;
     }
   }
 
+  async disconnect(hostName) {
+    if (!hostName) {
+      // Desconectar todos
+      for (const h of Object.keys(this.connections)) {
+        await this.disconnect(h);
+      }
+      return;
+    }
+
+    const connData = this.connections[hostName];
+    if (connData) {
+      if (connData.connection) {
+        try {
+          await connData.connection.end();
+        } catch (error) {
+          console.error(`⚠️ Erro ao fechar conexão MySQL (host: ${hostName}):`, error.message);
+        }
+      }
+      if (connData.sshTunnel) {
+        try {
+          connData.sshTunnel.close();
+          console.error(`🔐 Túnel SSH fechado (host: ${hostName})`);
+        } catch (error) {
+          console.error(`⚠️ Erro ao fechar túnel SSH (host: ${hostName}):`, error.message);
+        }
+      }
+      delete this.connections[hostName];
+    }
+  }
+
+  async getConnection(hostName) {
+    hostName = this.validateHost(hostName);
+    if (!this.connections[hostName] || !this.connections[hostName].connection) {
+      await this.connect(hostName);
+    }
+    return this.connections[hostName].connection;
+  }
+
   setupHandlers() {
     // Listar ferramentas disponíveis
     this.server.setRequestHandler(ListToolsRequestSchema, async () => {
+      const availableHosts = this.getAvailableHosts();
+      const hostsDescription = availableHosts.length > 0 
+        ? `Hosts disponíveis: ${availableHosts.join(', ')}`
+        : 'Configure hosts usando MYSQL_HOSTS ou variáveis com prefixo';
+      
       return {
         tools: [
           {
@@ -321,6 +482,10 @@ class MySQLControlBridge {
             inputSchema: {
               type: 'object',
               properties: {
+                host: {
+                  type: 'string',
+                  description: `Nome do host a usar. ${hostsDescription}`,
+                },
                 query: {
                   type: 'string',
                   description: 'Query SELECT para executar',
@@ -342,6 +507,10 @@ class MySQLControlBridge {
             inputSchema: {
               type: 'object',
               properties: {
+                host: {
+                  type: 'string',
+                  description: `Nome do host a usar. ${hostsDescription}`,
+                },
                 tableName: {
                   type: 'string',
                   description: 'Nome da tabela',
@@ -357,6 +526,10 @@ class MySQLControlBridge {
             inputSchema: {
               type: 'object',
               properties: {
+                host: {
+                  type: 'string',
+                  description: `Nome do host a usar. ${hostsDescription}`,
+                },
                 viewName: {
                   type: 'string',
                   description: 'Nome da view',
@@ -372,6 +545,10 @@ class MySQLControlBridge {
             inputSchema: {
               type: 'object',
               properties: {
+                host: {
+                  type: 'string',
+                  description: `Nome do host a usar. ${hostsDescription}`,
+                },
                 tableName: {
                   type: 'string',
                   description: 'Nome da tabela',
@@ -387,6 +564,10 @@ class MySQLControlBridge {
             inputSchema: {
               type: 'object',
               properties: {
+                host: {
+                  type: 'string',
+                  description: `Nome do host a usar. ${hostsDescription}`,
+                },
                 tableName: {
                   type: 'string',
                   description: 'Nome da tabela (opcional, vazio para listar todos)',
@@ -400,7 +581,12 @@ class MySQLControlBridge {
             description: 'Lista todas as stored procedures do banco de dados',
             inputSchema: {
               type: 'object',
-              properties: {},
+              properties: {
+                host: {
+                  type: 'string',
+                  description: `Nome do host a usar. ${hostsDescription}`,
+                },
+              },
             },
           },
           {
@@ -410,6 +596,10 @@ class MySQLControlBridge {
             inputSchema: {
               type: 'object',
               properties: {
+                host: {
+                  type: 'string',
+                  description: `Nome do host a usar. ${hostsDescription}`,
+                },
                 query: {
                   type: 'string',
                   description: 'Query para analisar',
@@ -424,7 +614,12 @@ class MySQLControlBridge {
             description: 'Lista todas as tabelas do banco de dados atual',
             inputSchema: {
               type: 'object',
-              properties: {},
+              properties: {
+                host: {
+                  type: 'string',
+                  description: `Nome do host a usar. ${hostsDescription}`,
+                },
+              },
             },
           },
           {
@@ -433,7 +628,12 @@ class MySQLControlBridge {
             description: 'Lista todos os bancos de dados disponíveis no servidor',
             inputSchema: {
               type: 'object',
-              properties: {},
+              properties: {
+                host: {
+                  type: 'string',
+                  description: `Nome do host a usar. ${hostsDescription}`,
+                },
+              },
             },
           }
         ],
@@ -442,38 +642,39 @@ class MySQLControlBridge {
 
     // Executar ferramentas
     this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
-      if (!this.connection) await this.connect();
-
       const { name, arguments: args } = request.params;
 
       try {
+        // Extrair host dos argumentos (pode ser undefined se não fornecido)
+        const hostName = args?.host;
+
         switch (name) {
           case 'execute_select_query':
-            return await this.executeSelectQuery(args);
+            return await this.executeSelectQuery(args, hostName);
 
           case 'describe_table':
-            return await this.describeTable(args.tableName);
+            return await this.describeTable(args.tableName, hostName);
 
           case 'describe_view':
-            return await this.describeView(args.viewName);
+            return await this.describeView(args.viewName, hostName);
 
           case 'describe_indexes':
-            return await this.describeIndexes(args.tableName);
+            return await this.describeIndexes(args.tableName, hostName);
 
           case 'describe_triggers':
-            return await this.describeTriggers(args.tableName);
+            return await this.describeTriggers(args.tableName, hostName);
 
           case 'describe_procedures':
-            return await this.describeProcedures();
+            return await this.describeProcedures(hostName);
 
           case 'explain_query':
-            return await this.explainQuery(args.query);
+            return await this.explainQuery(args.query, hostName);
 
           case 'show_tables':
-            return await this.showTables();
+            return await this.showTables(hostName);
 
           case 'show_databases':
-            return await this.showDatabases();
+            return await this.showDatabases(hostName);
 
           default:
             throw new Error(`Ferramenta desconhecida: ${name}`);
@@ -490,7 +691,9 @@ class MySQLControlBridge {
     });
   }
 
-  async executeSelectQuery(args) {
+  async executeSelectQuery(args, hostName) {
+    const connection = await this.getConnection(hostName);
+    
     // Normalizar query: trim inicial
     let query = args.query.trim();
     
@@ -527,22 +730,26 @@ class MySQLControlBridge {
       finalQuery += ';';
     }
 
-    const [results] = await this.connection.execute(finalQuery);
+    const [results] = await connection.execute(finalQuery);
 
     return {
       content: [{
         type: 'text',
-        text: `✅ Query executada com sucesso!\n\n📊 **Resultados (${results.length} linhas):**\n\n\`\`\`json\n${JSON.stringify(results, null, 2)}\n\`\`\``,
+        text: `✅ Query executada com sucesso! [host: ${hostName}]\n\n📊 **Resultados (${results.length} linhas):**\n\n\`\`\`json\n${JSON.stringify(results, null, 2)}\n\`\`\``,
       }],
     };
   }
 
-  async describeTable(tableName) {
+  async describeTable(tableName, hostName) {
+    const connection = await this.getConnection(hostName);
+    const config = this.hostsConfig[hostName];
+    const database = config.MYSQL_DATABASE;
+    
     if (!tableName) {
       throw new Error('Nome da tabela é obrigatório');
     }
 
-    const [desc] = await this.connection.execute(`
+    const [desc] = await connection.execute(`
       SELECT
         COLUMN_NAME as Campo,
         COLUMN_TYPE as Tipo,
@@ -554,14 +761,14 @@ class MySQLControlBridge {
       FROM information_schema.COLUMNS
       WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
       ORDER BY ORDINAL_POSITION
-    `, [process.env.MYSQL_DATABASE, tableName]);
+    `, [database, tableName]);
 
     if (desc.length === 0) {
-      throw new Error(`Tabela '${tableName}' não encontrada no banco '${process.env.MYSQL_DATABASE}'`);
+      throw new Error(`Tabela '${tableName}' não encontrada no banco '${database}' [host: ${hostName}]`);
     }
 
     // Buscar informações adicionais sobre a tabela
-    const [tableInfo] = await this.connection.execute(`
+    const [tableInfo] = await connection.execute(`
       SELECT
         TABLE_TYPE as Tipo,
         ENGINE as Engine,
@@ -570,25 +777,29 @@ class MySQLControlBridge {
         TABLE_COMMENT as Comentário
       FROM information_schema.TABLES
       WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
-    `, [process.env.MYSQL_DATABASE, tableName]);
+    `, [database, tableName]);
 
     return {
       content: [{
         type: 'text',
-        text: `📋 **Estrutura da tabela \`${tableName}\`:**\n\n` +
+        text: `📋 **Estrutura da tabela \`${tableName}\` [host: ${hostName}]:**\n\n` +
           `**Informações Gerais:**\n\`\`\`json\n${JSON.stringify(tableInfo[0], null, 2)}\n\`\`\`\n\n` +
           `**Colunas:**\n\`\`\`json\n${JSON.stringify(desc, null, 2)}\n\`\`\``,
       }],
     };
   }
 
-  async describeView(viewName) {
+  async describeView(viewName, hostName) {
+    const connection = await this.getConnection(hostName);
+    const config = this.hostsConfig[hostName];
+    const database = config.MYSQL_DATABASE;
+    
     if (!viewName) {
       throw new Error('Nome da view é obrigatório');
     }
 
     // Buscar definição da view
-    const [viewDef] = await this.connection.execute(`
+    const [viewDef] = await connection.execute(`
       SELECT
         TABLE_NAME as Nome,
         VIEW_DEFINITION as Definição,
@@ -598,14 +809,14 @@ class MySQLControlBridge {
         SECURITY_TYPE as TipoSegurança
       FROM information_schema.VIEWS
       WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
-    `, [process.env.MYSQL_DATABASE, viewName]);
+    `, [database, viewName]);
 
     if (viewDef.length === 0) {
-      throw new Error(`View '${viewName}' não encontrada no banco '${process.env.MYSQL_DATABASE}'`);
+      throw new Error(`View '${viewName}' não encontrada no banco '${database}' [host: ${hostName}]`);
     }
 
     // Buscar estrutura das colunas da view
-    const [columns] = await this.connection.execute(`
+    const [columns] = await connection.execute(`
       SELECT
         COLUMN_NAME as Campo,
         DATA_TYPE as TipoDados,
@@ -615,12 +826,12 @@ class MySQLControlBridge {
       FROM information_schema.COLUMNS
       WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
       ORDER BY ORDINAL_POSITION
-    `, [process.env.MYSQL_DATABASE, viewName]);
+    `, [database, viewName]);
 
     return {
       content: [{
         type: 'text',
-        text: `👁️ **Informações da view \`${viewName}\`:**\n\n` +
+        text: `👁️ **Informações da view \`${viewName}\` [host: ${hostName}]:**\n\n` +
           `**Definição:**\n\`\`\`json\n${JSON.stringify(viewDef[0], null, 2)}\n\`\`\`\n\n` +
           `**Colunas:**\n\`\`\`json\n${JSON.stringify(columns, null, 2)}\n\`\`\`\n\n` +
           `**SQL da View:**\n\`\`\`sql\nCREATE OR REPLACE VIEW \`${viewName}\` AS ${viewDef[0].Definição}\n\`\`\``,
@@ -628,12 +839,16 @@ class MySQLControlBridge {
     };
   }
 
-  async describeIndexes(tableName) {
+  async describeIndexes(tableName, hostName) {
+    const connection = await this.getConnection(hostName);
+    const config = this.hostsConfig[hostName];
+    const database = config.MYSQL_DATABASE;
+    
     if (!tableName) {
       throw new Error('Nome da tabela é obrigatório');
     }
 
-    const [indexes] = await this.connection.execute(`
+    const [indexes] = await connection.execute(`
       SELECT
         INDEX_NAME as NomeIndice,
         COLUMN_NAME as Coluna,
@@ -646,21 +861,25 @@ class MySQLControlBridge {
       FROM information_schema.STATISTICS
       WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
       ORDER BY INDEX_NAME, SEQ_IN_INDEX
-    `, [process.env.MYSQL_DATABASE, tableName]);
+    `, [database, tableName]);
 
     if (indexes.length === 0) {
-      throw new Error(`Nenhum índice encontrado para a tabela '${tableName}' ou tabela não existe`);
+      throw new Error(`Nenhum índice encontrado para a tabela '${tableName}' ou tabela não existe [host: ${hostName}]`);
     }
 
     return {
       content: [{
         type: 'text',
-        text: `🔑 **Índices da tabela \`${tableName}\`:**\n\n\`\`\`json\n${JSON.stringify(indexes, null, 2)}\n\`\`\``,
+        text: `🔑 **Índices da tabela \`${tableName}\` [host: ${hostName}]:**\n\n\`\`\`json\n${JSON.stringify(indexes, null, 2)}\n\`\`\``,
       }],
     };
   }
 
-  async describeTriggers(tableName) {
+  async describeTriggers(tableName, hostName) {
+    const connection = await this.getConnection(hostName);
+    const config = this.hostsConfig[hostName];
+    const database = config.MYSQL_DATABASE;
+    
     let query = `
       SELECT
         TRIGGER_NAME as NomeTrigger,
@@ -674,7 +893,7 @@ class MySQLControlBridge {
       FROM information_schema.TRIGGERS
       WHERE TRIGGER_SCHEMA = ?
     `;
-    const params = [process.env.MYSQL_DATABASE];
+    const params = [database];
 
     if (tableName) {
       query += ' AND EVENT_OBJECT_TABLE = ?';
@@ -683,25 +902,29 @@ class MySQLControlBridge {
 
     query += ' ORDER BY TRIGGER_NAME';
 
-    const [triggers] = await this.connection.execute(query, params);
+    const [triggers] = await connection.execute(query, params);
 
     if (triggers.length === 0) {
       const message = tableName 
-        ? `Nenhum trigger encontrado para a tabela '${tableName}'`
-        : `Nenhum trigger encontrado no banco '${process.env.MYSQL_DATABASE}'`;
+        ? `Nenhum trigger encontrado para a tabela '${tableName}' [host: ${hostName}]`
+        : `Nenhum trigger encontrado no banco '${database}' [host: ${hostName}]`;
       throw new Error(message);
     }
 
     return {
       content: [{
         type: 'text',
-        text: `⚡ **Triggers${tableName ? ` da tabela \`${tableName}\`` : ''}:**\n\n\`\`\`json\n${JSON.stringify(triggers, null, 2)}\n\`\`\``,
+        text: `⚡ **Triggers${tableName ? ` da tabela \`${tableName}\`` : ''} [host: ${hostName}]:**\n\n\`\`\`json\n${JSON.stringify(triggers, null, 2)}\n\`\`\``,
       }],
     };
   }
 
-  async describeProcedures() {
-    const [procedures] = await this.connection.execute(`
+  async describeProcedures(hostName) {
+    const connection = await this.getConnection(hostName);
+    const config = this.hostsConfig[hostName];
+    const database = config.MYSQL_DATABASE;
+    
+    const [procedures] = await connection.execute(`
       SELECT
         ROUTINE_NAME as Nome,
         ROUTINE_TYPE as Tipo,
@@ -712,13 +935,13 @@ class MySQLControlBridge {
       FROM information_schema.ROUTINES
       WHERE ROUTINE_SCHEMA = ?
       ORDER BY ROUTINE_NAME
-    `, [process.env.MYSQL_DATABASE]);
+    `, [database]);
 
     if (procedures.length === 0) {
       return {
         content: [{
           type: 'text',
-          text: `ℹ️ Nenhuma stored procedure ou função encontrada no banco '${process.env.MYSQL_DATABASE}'`,
+          text: `ℹ️ Nenhuma stored procedure ou função encontrada no banco '${database}' [host: ${hostName}]`,
         }],
       };
     }
@@ -726,12 +949,14 @@ class MySQLControlBridge {
     return {
       content: [{
         type: 'text',
-        text: `📦 **Stored Procedures e Funções do banco \`${process.env.MYSQL_DATABASE}\`:**\n\n\`\`\`json\n${JSON.stringify(procedures, null, 2)}\n\`\`\``,
+        text: `📦 **Stored Procedures e Funções do banco \`${database}\` [host: ${hostName}]:**\n\n\`\`\`json\n${JSON.stringify(procedures, null, 2)}\n\`\`\``,
       }],
     };
   }
 
-  async explainQuery(query) {
+  async explainQuery(query, hostName) {
+    const connection = await this.getConnection(hostName);
+    
     if (!query || !query.trim()) {
       throw new Error('Query é obrigatória');
     }
@@ -778,18 +1003,22 @@ class MySQLControlBridge {
       );
     }
 
-    const [explain] = await this.connection.execute(`EXPLAIN ${query}`);
+    const [explain] = await connection.execute(`EXPLAIN ${query}`);
 
     return {
       content: [{
         type: 'text',
-        text: `🔍 **Plano de execução:**\n\n\`\`\`json\n${JSON.stringify(explain, null, 2)}\n\`\`\``,
+        text: `🔍 **Plano de execução [host: ${hostName}]:**\n\n\`\`\`json\n${JSON.stringify(explain, null, 2)}\n\`\`\``,
       }],
     };
   }
 
-  async showTables() {
-    const [tables] = await this.connection.execute(`
+  async showTables(hostName) {
+    const connection = await this.getConnection(hostName);
+    const config = this.hostsConfig[hostName];
+    const database = config.MYSQL_DATABASE;
+    
+    const [tables] = await connection.execute(`
       SELECT
         TABLE_NAME as Nome,
         TABLE_TYPE as Tipo,
@@ -800,13 +1029,13 @@ class MySQLControlBridge {
       FROM information_schema.TABLES
       WHERE TABLE_SCHEMA = ?
       ORDER BY TABLE_TYPE, TABLE_NAME
-    `, [process.env.MYSQL_DATABASE]);
+    `, [database]);
 
     if (tables.length === 0) {
       return {
         content: [{
           type: 'text',
-          text: `ℹ️ Nenhuma tabela encontrada no banco '${process.env.MYSQL_DATABASE}'`,
+          text: `ℹ️ Nenhuma tabela encontrada no banco '${database}' [host: ${hostName}]`,
         }],
       };
     }
@@ -814,13 +1043,15 @@ class MySQLControlBridge {
     return {
       content: [{
         type: 'text',
-        text: `📋 **Tabelas e Views do banco \`${process.env.MYSQL_DATABASE}\`:**\n\n\`\`\`json\n${JSON.stringify(tables, null, 2)}\n\`\`\``,
+        text: `📋 **Tabelas e Views do banco \`${database}\` [host: ${hostName}]:**\n\n\`\`\`json\n${JSON.stringify(tables, null, 2)}\n\`\`\``,
       }],
     };
   }
 
-  async showDatabases() {
-    const [databases] = await this.connection.execute(`
+  async showDatabases(hostName) {
+    const connection = await this.getConnection(hostName);
+    
+    const [databases] = await connection.execute(`
       SELECT
         SCHEMA_NAME as Nome,
         DEFAULT_CHARACTER_SET_NAME as CharsetPadrao,
@@ -833,7 +1064,7 @@ class MySQLControlBridge {
       return {
         content: [{
           type: 'text',
-          text: `ℹ️ Nenhum banco de dados encontrado`,
+          text: `ℹ️ Nenhum banco de dados encontrado [host: ${hostName}]`,
         }],
       };
     }
@@ -841,7 +1072,7 @@ class MySQLControlBridge {
     return {
       content: [{
         type: 'text',
-        text: `🗄️ **Bancos de dados disponíveis:**\n\n\`\`\`json\n${JSON.stringify(databases, null, 2)}\n\`\`\``,
+        text: `🗄️ **Bancos de dados disponíveis [host: ${hostName}]:**\n\n\`\`\`json\n${JSON.stringify(databases, null, 2)}\n\`\`\``,
       }],
     };
   }
@@ -849,7 +1080,11 @@ class MySQLControlBridge {
   async run() {
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
-    console.error('🚀 MySQL Control Bridge iniciado (v1.2.0)');
+    console.error('🚀 MySQL Control Bridge iniciado (v1.3.0)');
+    const hosts = this.getAvailableHosts();
+    if (hosts.length > 0) {
+      console.error(`📡 Hosts configurados: ${hosts.join(', ')}`);
+    }
   }
 }
 
@@ -863,13 +1098,7 @@ server.run().catch((error) => {
 // Cleanup
 async function cleanup() {
   console.error('🔌 Desconectando...');
-  if (server.connection) {
-    await server.connection.end();
-  }
-  if (server.sshTunnel) {
-    server.sshTunnel.close();
-    console.error('🔐 Túnel SSH fechado');
-  }
+  await server.disconnect();
 }
 
 process.on('SIGINT', async () => {

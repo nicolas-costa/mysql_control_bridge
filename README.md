@@ -20,6 +20,7 @@ Servidor MCP (Model Context Protocol) para integração com MySQL, permitindo qu
 ### Conexão
 - **Conexão direta** - Conecte-se diretamente ao MySQL
 - **Túnel SSH** - Conecte-se através de túnel SSH usando arquivo de chave (.pem/.cer)
+- **Múltiplos hosts** - Suporte a conexões simultâneas com múltiplos servidores MySQL
 - **Configuração flexível** - Suporte a múltiplos ambientes e interpolação de variáveis
 
 ### Segurança
@@ -79,6 +80,114 @@ SSH_PASSPHRASE=senha_chave           # Senha da chave privada (opcional, apenas 
 - O caminho do arquivo pode ser absoluto ou relativo ao diretório de trabalho
 - Se todas as variáveis SSH (`SSH_HOST`, `SSH_USER`, `SSH_KEY_FILE`) estiverem configuradas, o túnel SSH será criado automaticamente
 - Se nenhuma variável SSH estiver configurada, a conexão será direta ao MySQL (comportamento padrão)
+
+### Suporte a Múltiplos Hosts
+
+O MySQL Control Bridge agora suporta conexões simultâneas com múltiplos servidores MySQL. Cada host é identificado por um nome único e pode ter suas próprias credenciais e configurações SSH.
+
+**Formato de configuração:**
+
+As credenciais podem ser configuradas de três formas:
+
+#### Opção 1: Variável MYSQL_HOSTS (JSON)
+
+Configure múltiplos hosts usando uma variável JSON:
+
+```json
+{
+  "mcpServers": {
+    "mysql": {
+      "command": "npx",
+      "args": ["-y", "mysql_control_bridge"],
+      "env": {
+        "MYSQL_HOSTS": "{\"prod\":{\"MYSQL_HOST\":\"prod.example.com\",\"MYSQL_USER\":\"user\",\"MYSQL_PASSWORD\":\"pass\",\"MYSQL_DATABASE\":\"db\"},\"dev\":{\"MYSQL_HOST\":\"dev.example.com\",\"MYSQL_USER\":\"dev_user\",\"MYSQL_PASSWORD\":\"dev_pass\",\"MYSQL_DATABASE\":\"dev_db\"}}"
+      }
+    }
+  }
+}
+```
+
+#### Opção 2: Padrão de prefixo (HOSTNAME_*)
+
+Configure hosts usando variáveis com prefixo:
+
+```json
+{
+  "mcpServers": {
+    "mysql": {
+      "command": "npx",
+      "args": ["-y", "mysql_control_bridge"],
+      "env": {
+        "PROD_MYSQL_HOST": "prod.example.com",
+        "PROD_MYSQL_USER": "user",
+        "PROD_MYSQL_PASSWORD": "pass",
+        "PROD_MYSQL_DATABASE": "db",
+        "DEV_MYSQL_HOST": "dev.example.com",
+        "DEV_MYSQL_USER": "dev_user",
+        "DEV_MYSQL_PASSWORD": "dev_pass",
+        "DEV_MYSQL_DATABASE": "dev_db"
+      }
+    }
+  }
+}
+```
+
+#### Opção 3: Modo compatibilidade (host único)
+
+Para manter compatibilidade com versões anteriores, se apenas variáveis diretas forem configuradas (sem `MYSQL_HOSTS` ou prefixos), o sistema criará automaticamente um host chamado `"default"`:
+
+```json
+{
+  "mcpServers": {
+    "mysql": {
+      "command": "npx",
+      "args": ["-y", "mysql_control_bridge"],
+      "env": {
+        "MYSQL_HOST": "localhost",
+        "MYSQL_USER": "user",
+        "MYSQL_PASSWORD": "pass",
+        "MYSQL_DATABASE": "db"
+      }
+    }
+  }
+}
+```
+
+**Uso nas ferramentas:**
+
+Todas as ferramentas agora aceitam um parâmetro opcional `host` para especificar qual servidor usar:
+
+```json
+{
+  "host": "prod",
+  "query": "SELECT * FROM usuarios LIMIT 10"
+}
+```
+
+Se apenas um host estiver configurado, o parâmetro `host` pode ser omitido. Se múltiplos hosts estiverem configurados, o parâmetro `host` é obrigatório.
+
+**Exemplo com múltiplos hosts e SSH:**
+
+```json
+{
+  "mcpServers": {
+    "mysql": {
+      "command": "npx",
+      "args": ["-y", "mysql_control_bridge"],
+      "env": {
+        "MYSQL_HOSTS": "{\"prod\":{\"MYSQL_HOST\":\"localhost\",\"MYSQL_USER\":\"user\",\"MYSQL_PASSWORD\":\"pass\",\"MYSQL_DATABASE\":\"db\",\"SSH_HOST\":\"prod-server.com\",\"SSH_USER\":\"ssh_user\",\"SSH_KEY_FILE\":\"/path/to/key.pem\"},\"dev\":{\"MYSQL_HOST\":\"localhost\",\"MYSQL_USER\":\"dev_user\",\"MYSQL_PASSWORD\":\"dev_pass\",\"MYSQL_DATABASE\":\"dev_db\"}}"
+      }
+    }
+  }
+}
+```
+
+**Gerenciamento de conexões:**
+
+- Cada host mantém sua própria conexão MySQL e túnel SSH (se aplicável)
+- Conexões são reutilizadas automaticamente quando possível
+- Conexões expiradas são detectadas e reconectadas automaticamente
+- Todas as conexões são fechadas adequadamente no shutdown
 
 ## Configuração das Variáveis de Ambiente
 
@@ -387,6 +496,7 @@ O sistema resolve interpolações iterativamente, permitindo referências encade
 Executa queries SELECT com segurança.
 
 **Parâmetros:**
+- `host` (string, opcional): Nome do host a usar (obrigatório se múltiplos hosts estiverem configurados)
 - `query` (string, obrigatório): Query SELECT para executar
 - `limit` (number, opcional): Limite de resultados (máximo 1000, padrão 100)
 
@@ -399,6 +509,7 @@ SELECT * FROM usuarios WHERE ativo = 1
 Mostra a estrutura detalhada de uma tabela (colunas, tipos, chaves, engine, etc.).
 
 **Parâmetros:**
+- `host` (string, opcional): Nome do host a usar (obrigatório se múltiplos hosts estiverem configurados)
 - `tableName` (string, obrigatório): Nome da tabela
 
 **Exemplo:**
@@ -410,6 +521,7 @@ usuarios
 Mostra a definição e estrutura de uma view.
 
 **Parâmetros:**
+- `host` (string, opcional): Nome do host a usar (obrigatório se múltiplos hosts estiverem configurados)
 - `viewName` (string, obrigatório): Nome da view
 
 **Exemplo:**
@@ -421,6 +533,7 @@ v_relatorio_vendas
 Lista todos os índices de uma tabela.
 
 **Parâmetros:**
+- `host` (string, opcional): Nome do host a usar (obrigatório se múltiplos hosts estiverem configurados)
 - `tableName` (string, obrigatório): Nome da tabela
 
 **Exemplo:**
@@ -432,6 +545,7 @@ pedidos
 Lista todos os triggers de uma tabela específica ou de todo o banco.
 
 **Parâmetros:**
+- `host` (string, opcional): Nome do host a usar (obrigatório se múltiplos hosts estiverem configurados)
 - `tableName` (string, opcional): Nome da tabela (deixe vazio para listar todos)
 
 **Exemplo:**
@@ -443,12 +557,14 @@ ou deixe vazio para listar todos os triggers do banco.
 ### 6. describe_procedures
 Lista todas as stored procedures e funções do banco de dados.
 
-**Sem parâmetros**
+**Parâmetros:**
+- `host` (string, opcional): Nome do host a usar (obrigatório se múltiplos hosts estiverem configurados)
 
 ### 7. explain_query
 Analisa o plano de execução de uma query.
 
 **Parâmetros:**
+- `host` (string, opcional): Nome do host a usar (obrigatório se múltiplos hosts estiverem configurados)
 - `query` (string, obrigatório): Query para analisar
 
 **Exemplo:**
@@ -459,12 +575,14 @@ SELECT * FROM pedidos p JOIN usuarios u ON p.usuario_id = u.id WHERE u.cidade = 
 ### 8. show_tables
 Lista todas as tabelas e views do banco de dados atual.
 
-**Sem parâmetros**
+**Parâmetros:**
+- `host` (string, opcional): Nome do host a usar (obrigatório se múltiplos hosts estiverem configurados)
 
 ### 9. show_databases
 Lista todos os bancos de dados disponíveis no servidor MySQL.
 
-**Sem parâmetros**
+**Parâmetros:**
+- `host` (string, opcional): Nome do host a usar (obrigatório se múltiplos hosts estiverem configurados)
 
 ## Exemplos de Uso no Cursor
 
@@ -543,7 +661,7 @@ Após configurar o servidor, você pode usar comandos como:
 
 ## Versão
 
-1.2.0
+1.3.0
 
 ## Licença
 
